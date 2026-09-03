@@ -1,0 +1,33 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_LCD
+	tristate "Runtime LCD enable demo"
+	default n
+	depends on GD32H7_TLI
+	---help---
+		Enable the 'lcd' command: brings up the TLI/LCD on demand
+		(SDRAM + pixel clock + GPIO + timing + layer 0 + panel reset)
+		via board_lcd_enable() and draws a test pattern.  The display
+		is NOT initialised at boot.
+
+if EXAMPLES_LCD
+
+config EXAMPLES_LCD_PROGNAME
+	string "Program name"
+	default "lcd"
+	---help---
+		This is the name of the program that will be used when the NSH
+		program is installed.
+
+config EXAMPLES_LCD_PRIORITY
+	int "LCD demo task priority"
+	default 100
+
+config EXAMPLES_LCD_STACKSIZE
+	int "LCD demo stack size"
+	default DEFAULT_TASK_STACKSIZE
+
+endif
