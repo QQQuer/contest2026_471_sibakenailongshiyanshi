@@ -1,0 +1,32 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config EXAMPLES_GT911
+	tristate "GT911 capacitive touch demo"
+	default n
+	depends on GD32H759IMT6_GT911
+	---help---
+		Enable the GT911 capacitive touch demo.  Runs the 'gt911'
+		command: initializes the GT911 controller and prints/paints
+		the first touch point.
+
+if EXAMPLES_GT911
+
+config EXAMPLES_GT911_PROGNAME
+	string "Program name"
+	default "gt911"
+	---help---
+		This is the name of the program that will be used when the NSH
+		program is installed.
+
+config EXAMPLES_GT911_PRIORITY
+	int "GT911 demo task priority"
+	default 100
+
+config EXAMPLES_GT911_STACKSIZE
+	int "GT911 demo stack size"
+	default DEFAULT_TASK_STACKSIZE
+
+endif
