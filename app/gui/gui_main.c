@@ -1,17 +1,25 @@
 /****************************************************************************
- * gui_main.c - OpenVela demo GUI v42
+ * gui_main.c - OpenVela contest demo GUI
  *
- * Pages:
- *   0 main     : WQY title (top-centre) + 4 entry buttons (names only)
+ * Pages (entered from the main-page buttons, or from the serial console):
+ *   0 main     : WQY title (top-centre) + 3 entry buttons
  *   1 touch    : finger drawing + live coordinate (x:123, y:123) top-right
- *   2 hand     : handwriting 0-9, recognise on finger lift, result top-right
- *   3 measure  : measurement control placeholder
+ *   3 measure  : ADC + FFT spectrum analyser (time domain + magnitude)
  *   4 sysinfo  : system information (incl. screen model)
- * Input: GT911 touch (board lower-half) + serial keys 1-4 / b as fallback.
  *
- * Handwriting recogniser: 16x16 grid rasterisation of the stroke bbox,
- * matched against 10 pre-rendered WQY digit templates (ncr_templates.h)
- * by pixel coverage.  Self-contained, no external recognition library.
+ * Input: GT911 touch (board lower-half).  Serial fallback: keys 1/2/3
+ * enter pages 1/3/4, b returns to the main page, q quits.
+ *
+ * All drawing writes straight into the RGB565 frame buffer in SDRAM at
+ * 0xC0000000 (the TLI driver scans it out); there is no NX / graphics
+ * library involved.
+ *
+ * The handwriting page (page 2) and its 16x16 grid recogniser - stroke
+ * bbox rasterisation matched against 10 pre-rendered WQY digit templates
+ * (ncr_templates.h) by pixel coverage - are still compiled in but no
+ * longer reachable: the v54 layout dropped the entry button because
+ * recognition proved unreliable in practice.  draw_hand_page(), the ncr_*
+ * helpers and their state are kept for reference.
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -285,7 +293,7 @@ struct btn
 #define BTN_Y0 200
 #define BTN_GAP 16
 
-/* Handwriting recognition removed (v54): three entries only */
+/* v54: the handwriting entry was dropped - three buttons only */
 static const struct btn g_btns[3] =
 {
   { BTN_X, BTN_Y0,                       BTN_W, BTN_H, PG_TOUCH,
@@ -971,7 +979,9 @@ static void draw_page(void)
 {
   if (g_cal9 < C9_PTS)
     {
-      /* calibration pages kept for completeness (not used in v42) */
+      /* Touch calibration pages.  g_cal9 is set to C9_PTS at startup, so
+       * this never triggers; the code is kept for completeness.
+       */
       return;
     }
 
@@ -1189,7 +1199,8 @@ int main(int argc, FAR char *argv[])
     }
 
   g_cal = CAL_NONE;
-  g_cal9 = C9_PTS;   /* v40: no calibration needed, raw coords are 0..800 x 0..480 */
+  g_cal9 = C9_PTS;   /* raw GT911 coords already map 1:1 onto the 800x480
+                      * panel, so skip the touch calibration pages */
   g_lrx = g_lry = -1;
   g_page = PG_MAIN;
   ncr_reset();
