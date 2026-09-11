@@ -581,8 +581,6 @@ static void ncr_end(void)
 
   g_tx = g_ty = -1;
   ncr_show_result(r);
-  printf("NCR: %d pts -> %s\n", g_ncr_n,
-         (r < 0) ? "?" : (const char[]){ (char)('0' + r), '\0' });
 
   /* auto-clear the drawing area so the next digit can be written right
    * away; the result panel keeps showing the last recognition */
@@ -683,15 +681,13 @@ static void draw_hand_page(void)
 /* ------------------------------------------------------------------ */
 /* Register-only access (no kernel driver change), same style as the
  * TLI/GT911 bring-up:
- *   ADC0  = 0x40012400, 14-bit, CH18 = PA4
- *   DAC0  = 0x40007400, DAC_OUT0 = PA4 (on-chip sine self-test source)
- *   RCU   = 0x58024400  APB1EN +0x40 bit29=DAC, APB2EN +0x44 bit8=ADC0,
+ *   ADC0  = 0x40012400, 14-bit, CH18 = PA4 (external signal input)
+ *   RCU   = 0x58024400  APB2EN +0x44 bit8=ADC0,
  *                        AHB4EN +0x3C bit0=GPIOA (already on)
  *   GPIOA = 0x58020000  PA4 analog: CTL bits[9:8]=11, PUD bits[9:8]=00
  */
 #define VREG(a)     (*(volatile uint32_t *)(a))
 #define ADC0_BASE   0x40012400UL
-#define DAC0_BASE   0x40007400UL
 #define RCU_BASE    0x58024400UL
 #define GPIOA_BASE  0x58020000UL
 
@@ -702,12 +698,9 @@ static void draw_hand_page(void)
 #define ADC_RSQ8    VREG(ADC0_BASE + 0x44)
 #define ADC_RDATA   VREG(ADC0_BASE + 0x64)
 #define ADC_SYNCCTL VREG(ADC0_BASE + 0x304)
-#define RCU_APB1EN  VREG(RCU_BASE + 0x40)
 #define RCU_APB2EN  VREG(RCU_BASE + 0x44)
 #define GPIOA_CTL   VREG(GPIOA_BASE + 0x00)
 #define GPIOA_PUD   VREG(GPIOA_BASE + 0x0C)
-#define DAC_CTL0    VREG(DAC0_BASE + 0x00)
-#define DAC_DOUT0   VREG(DAC0_BASE + 0x08)   /* OUT0 12-bit right aligned */
 
 #define FFT_N   256
 #define SP_X    30
@@ -721,42 +714,53 @@ static void draw_hand_page(void)
 
 static float g_re[FFT_N];
 static float g_im[FFT_N];
-static int   g_dac_on = 1;
 static int   g_spec_inited = 0;
 static int   g_adc_min = 0;
 static int   g_adc_max = 0;
 static int   g_adc_avg = 0;
-static int   g_spec_frames = 0;
 static int   g_adc_err = 0;
 
-/* 32-point 12-bit sine table: 2048 + 1800*sin(2*pi*i/32) */
-static const uint16_t g_sine32[32] =
+
+/* RCU APB2 reset control: +0x24, ADC0RST = bit8 (example18 adc_deinit) */
+#define RCU_APB2RST  VREG(RCU_BASE + 0x24)
+#define RCU_APB4EN   VREG(RCU_BASE + 0x4C)
+#define VREF_CS_REG  VREG(0x58003800)
+
+/* enable internal voltage reference: VREFP = 2.5V for ADC */
+static void vref_enable(void)
 {
-  2048, 2399, 2737, 3048, 3321, 3544, 3711, 3814,
-  3848, 3814, 3711, 3544, 3321, 3048, 2737, 2399,
-  2048, 1697, 1359, 1048,  775,  552,  385,  282,
-   248,  282,  385,  552,  775, 1048, 1359, 1697
-};
+  RCU_APB4EN |= (1u << 2);                 /* VREF clock on (APB4EN bit2) */
+  VREF_CS_REG = (VREF_CS_REG & ~(0x3u << 4)) | (0u << 4); /* VREFS = 2.5V */
+  VREF_CS_REG &= ~(1u << 1);               /* HIPM = 0 (drive VREFP pin) */
+  VREF_CS_REG |= (1u << 0);                /* VREFEN = 1 */
+  { int w = 0; while (!(VREF_CS_REG & (1u << 3)) && (++w < 100000)) ; }
+}
 
 static void adc0_init(void)
 {
+  vref_enable();
   RCU_APB2EN |= (1u << 8);                 /* ADC0 clock on */
+  RCU_APB2RST |= (1u << 8);                /* adc_deinit: reset ADC0 */
+  RCU_APB2RST &= ~(1u << 8);
 
   GPIOA_CTL = (GPIOA_CTL & ~(3u << 8)) | (3u << 8);  /* PA4 analog */
   GPIOA_PUD &= ~(3u << 8);
 
   ADC_CTL1 &= ~(1u << 0);                  /* ADC off during config */
   ADC_SYNCCTL = (ADC_SYNCCTL & ~((0xFu << 16) | (0xFu << 20))) | 0x000C0000u;
+  ADC_SYNCCTL &= ~(0xFu << 0);             /* sync mode: independent (=0) */
   ADC_CTL0 &= ~(0x3u << 24);               /* 14-bit resolution */
   ADC_CTL0 &= ~(1u << 8);                  /* scan mode off */
   ADC_CTL1 &= ~(1u << 1);                  /* continuous mode off */
   ADC_CTL1 &= ~(1u << 11);                 /* right aligned */
+  ADC_CTL1 &= ~(0x3u << 28);               /* ext trigger disable (ETMRC=0) */
   ADC_RSQ0 &= ~(0xFu << 20);               /* 1 conversion in sequence */
   ADC_RSQ8 = ((807u & 0x3FFu) << 5) | 0x12u;  /* rank0 = CH18, 807-clk */
 
   ADC_CTL1 |= (1u << 0);                   /* ADC on */
-  ADC_CTL1 &= ~(1u << 27);                 /* offset+mismatch calibration */
-  ADC_CTL1 &= ~(0x7u << 4);                /* 1 calibration */
+  usleep(10000);                           /* wait ADC stable, then calibrate */
+  ADC_CTL1 |= (1u << 27);                  /* calibration mode OFFSET (lib) */
+  ADC_CTL1 &= ~(0x7u << 4);                /* calibration number: 1 */
   ADC_CTL1 |= (1u << 3);                   /* reset calibration */
   while (ADC_CTL1 & (1u << 3));
   ADC_CTL1 |= (1u << 2);                   /* start calibration */
@@ -765,66 +769,26 @@ static void adc0_init(void)
   printf("SPECTRUM: ADC0 CH18(PA4) 14bit ready\n");
 }
 
-static void dac0_init(void)
-{
-  RCU_APB1EN |= (1u << 29);                /* DAC clock on */
-  VREG(DAC0_BASE + 0x3C) &= ~0x7u;         /* MODE0 = 0: normal, pin, buffer ON */
-  DAC_CTL0 |= (1u << 0);                   /* DAC_OUT0 enable (PA4) */
-  DAC_DOUT0 = 2048;                        /* mid-scale */
-  printf("SPECTRUM: DAC0 init APB1EN=%08x CTL0=%08x\n",
-         (unsigned)RCU_APB1EN, (unsigned)DAC_CTL0);
-}
-
-static void dac_adc_probe(void)
-{
-  static const uint16_t steps[3] = { 0, 2048, 4095 };
-  int s, i;
-
-  for (s = 0; s < 3; s++)
-    {
-      int sum = 0;
-
-      DAC_DOUT0 = steps[s];
-      for (i = 0; i < 32; i++)
-        {
-          ADC_CTL1 |= (1u << 30);              /* software start */
-          while (!(ADC_STAT & (1u << 1)));     /* wait EOC */
-          ADC_STAT &= ~(1u << 1);
-          sum += (int)(ADC_RDATA & 0x3FFF);
-        }
-      printf("SPECTRUM: probe DAC=%-4d -> ADC=%d\n",
-             steps[s], sum / 32);
-    }
-
-  printf("SPECTRUM: DAC_DOUT0 readback=%08x\n",
-         (unsigned)DAC_DOUT0);
-  DAC_DOUT0 = 2048;
-}
-
 static void spectrum_init_once(void)
 {
   if (!g_spec_inited)
     {
       adc0_init();
-      dac0_init();
-      dac_adc_probe();
       g_spec_inited = 1;
     }
 }
 
-/* Sample FFT_N points (software trigger); DAC sine advances in lockstep
- * so the same PA4 pin is both the test source and the ADC input. */
+/* Sample FFT_N points (software trigger) from external signal on PA4. */
 static void adc_sample(void)
 {
   int i;
 
+  RCU_APB2EN |= (1u << 8);             /* keep ADC0 clock alive (some path clears it) */
+
   for (i = 0; i < FFT_N; i++)
     {
-      if (g_dac_on)
-        {
-          DAC_DOUT0 = g_sine32[i & 31];
-        }
-
+      ADC_RSQ8 = ((807u & 0x3FFu) << 5) | 0x12u;  /* re-arm rank0 = CH18 */
+      ADC_STAT = ~(1u << 1);               /* clear EOC (stdlib adc_flag_clear) */
       ADC_CTL1 |= (1u << 30);              /* software start */
       {
         int spins = 0;
@@ -838,7 +802,6 @@ static void adc_sample(void)
               }
           }
       }
-      ADC_STAT &= ~(1u << 1);
       g_re[i] = (float)(ADC_RDATA & 0x3FFF);
       g_im[i] = 0.0f;
 
@@ -922,18 +885,7 @@ static void spectrum_draw(void)
   float pmax = 0.0f;
 
   spectrum_init_once();
-
-  /* diagnostic first (even if a later step hangs) */
-  if ((++g_spec_frames % 25) == 1 || g_spec_frames == 1)
-    {
-      printf("SPECTRUM: adc min=%d max=%d avg=%d err=%d "
-             "APB2EN=%08x CTL0=%08x CTL1=%08x RSQ8=%08x SYNC=%08x "
-             "DAC_CTL=%08x\n",
-             g_adc_min, g_adc_max, g_adc_avg, g_adc_err,
-             (unsigned)RCU_APB2EN, (unsigned)ADC_CTL0, (unsigned)ADC_CTL1,
-             (unsigned)ADC_RSQ8, (unsigned)ADC_SYNCCTL,
-             (unsigned)DAC_CTL0);
-    }
+  adc_sample();                       /* fill g_re[] with real samples */
 
   /* left: time-domain waveform */
   fb_fill(SP_X, SP_Y, SP_W, SP_H, C_WHITE);
@@ -1135,10 +1087,6 @@ static void touch_update(int x, int y)
       if (x >= HAND_X && x < HAND_X + HAND_W &&
           y >= HAND_Y && y < HAND_Y + HAND_H)
         {
-          if (g_ncr_idle > 0)
-            {
-              printf("NCR: down cancels idle\n");
-            }
           g_ncr_idle = 0;   /* touching again: cancel the pending result */
           if (g_tx >= 0 && g_ty >= 0)
             {
@@ -1214,12 +1162,6 @@ static void console_key(void)
       ncr_reset();
       draw_page();
     }
-  else if (c == 'd' || c == 'D')
-    {
-      g_dac_on = !g_dac_on;
-      printf("SPECTRUM: DAC self-test %s\n",
-             g_dac_on ? "ON" : "OFF");
-    }
   else if (c == 'q' || c == 'Q')
     {
       g_run = false;
@@ -1277,7 +1219,6 @@ int main(int argc, FAR char *argv[])
                    * one-shot edge trigger, not a per-loop reset. */
                   g_ncr_idle = 1;
                   g_tx = g_ty = -1;
-                  printf("NCR: up n=%d idle=1\n", g_ncr_n);
                 }
               else if (g_page == PG_TOUCH || g_page == PG_HAND)
                 {
@@ -1291,7 +1232,6 @@ int main(int argc, FAR char *argv[])
           if (++g_ncr_idle > NCR_IDLE_LOOPS)
             {
               g_ncr_idle = 0;
-              printf("NCR: idle timeout -> recognise\n");
               ncr_end();   /* stroke finished: recognise + auto-clear */
             }
         }
