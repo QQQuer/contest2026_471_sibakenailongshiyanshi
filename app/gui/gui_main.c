@@ -2,7 +2,7 @@
  * gui_main.c - OpenVela contest demo GUI
  *
  * Pages (entered from the main-page buttons, or from the serial console):
- *   0 main     : WQY title (top-centre) + 3 entry buttons
+ *   0 main     : WQY title (top-centre) + 4 entry buttons
  *   1 touch    : finger drawing + live coordinate (x:123, y:123) top-right
  *   3 measure  : ADC + FFT spectrum analyser (time domain + magnitude)
  *   4 sysinfo  : system information (incl. screen model)
@@ -14,12 +14,10 @@
  * 0xC0000000 (the TLI driver scans it out); there is no NX / graphics
  * library involved.
  *
- * The handwriting page (page 2) and its 16x16 grid recogniser - stroke
- * bbox rasterisation matched against 10 pre-rendered WQY digit templates
- * (ncr_templates.h) by pixel coverage - are still compiled in but no
- * longer reachable: the v54 layout dropped the entry button because
- * recognition proved unreliable in practice.  draw_hand_page(), the ncr_*
- * helpers and their state are kept for reference.
+ * Page 2 (handwriting) runs the 32x32 int8 MLP recogniser trained on the
+ * user's own strokes (digit_net.h, see hw_export/net_predict): lift the
+ * finger, the digit is exported over serial (HW: grid blocks) and shown
+ * on screen.  Reached from the main-page button (v70) or `gui hw`.
  ****************************************************************************/
 
 #include <nuttx/config.h>
@@ -33,10 +31,15 @@
 #include <errno.h>
 #include <sys/select.h>
 
+/* NuttX IRQ API (declared manually: <nuttx/irq.h> pulls in board headers
+ * that also declare led_init(), clashing with our static one) */
+extern int irq_attach(int irq, int (*isr)(int, void *, void *), void *arg);
+extern void up_enable_irq(int irq);
+
 #include "gui_title_bitmap.h"
 #include "gui_text.h"
 #include "gui_digits.h"
-#include "ncr_templates.h"
+#include "logo.h"
 
 /* board services (FLAT build) */
 extern int  board_lcd_enable(void);
@@ -51,6 +54,8 @@ extern int  gt911_lower_scan(FAR int *x, FAR int *y, FAR int *down);
 #define C_GREY    0x8c9aa8
 #define C_BORDER  0x5b96
 #define C_HILITE  0xdf1e    /* light blue pressed fill (RGB565) */
+#define C_RED     0xf800    /* red  (RGB565) */
+#define C_GREEN   0x07e0    /* green (RGB565) */
 
 /* ------------------------------------------------------------------ */
 /* framebuffer primitives                                              */
@@ -71,6 +76,21 @@ static void fb_fill(int x, int y, int w, int h, uint16_t c)
     {
       uint16_t *row = (uint16_t *)fb + (y + yy) * LCD_W + x;
       for (xx = 0; xx < w; xx++) { row[xx] = c; }
+    }
+}
+
+static void blit_rgb565(int x, int y, int w, int h,
+                        const uint16_t *buf)
+{
+  volatile uint16_t *fb = (volatile uint16_t *)0xc0000000;
+  int yy, xx;
+
+  for (yy = 0; yy < h; yy++)
+    {
+      uint16_t *dst = (uint16_t *)fb + (y + yy) * LCD_W + x;
+      const uint16_t *src = &buf[yy * w];
+
+      for (xx = 0; xx < w; xx++) { dst[xx] = src[xx]; }
     }
 }
 
@@ -288,19 +308,21 @@ struct btn
 };
 
 #define BTN_W 360
-#define BTN_H 52
+#define BTN_H 48
 #define BTN_X ((LCD_W - BTN_W) / 2)
-#define BTN_Y0 200
-#define BTN_GAP 16
+#define BTN_Y0 150
+#define BTN_GAP 12
 
-/* v54: the handwriting entry was dropped - three buttons only */
-static const struct btn g_btns[3] =
+/* v70: handwriting re-added (int8 MLP recogniser) - four buttons */
+static const struct btn g_btns[4] =
 {
-  { BTN_X, BTN_Y0,                       BTN_W, BTN_H, PG_TOUCH,
+  { BTN_X, BTN_Y0,                           BTN_W, BTN_H, PG_TOUCH,
     GUI_TXT_BTN1_W, GUI_TXT_BTN1_H, gui_txt_btn1_bits },
-  { BTN_X, BTN_Y0 + (BTN_H + BTN_GAP),   BTN_W, BTN_H, PG_MEAS,
+  { BTN_X, BTN_Y0 + 1 * (BTN_H + BTN_GAP),   BTN_W, BTN_H, PG_HAND,
+    GUI_TXT_BTN2_W, GUI_TXT_BTN2_H, gui_txt_btn2_bits },
+  { BTN_X, BTN_Y0 + 2 * (BTN_H + BTN_GAP),   BTN_W, BTN_H, PG_MEAS,
     GUI_TXT_BTN3_W, GUI_TXT_BTN3_H, gui_txt_btn3_bits },
-  { BTN_X, BTN_Y0 + 2 * (BTN_H + BTN_GAP), BTN_W, BTN_H, PG_SYS,
+  { BTN_X, BTN_Y0 + 3 * (BTN_H + BTN_GAP),   BTN_W, BTN_H, PG_SYS,
     GUI_TXT_BTN4_W, GUI_TXT_BTN4_H, gui_txt_btn4_bits },
 };
 
@@ -318,6 +340,12 @@ static const struct btn g_back =
 #define CLEAR_Y 300
 #define CLEAR_W 180
 #define CLEAR_H 56
+
+/* 32x32 grid export + right-hand 16x16 preview (int8 MLP, v70) */
+#define HW_N 32                        /* export grid resolution        */
+#define HW_GS 10                       /* preview cell (16*10=160px)    */
+#define HW_GX (HAND_X + HAND_W + 24)   /* 584 .. 776 inside 800         */
+#define HW_GY (HAND_Y - 10)            /* 100: sits above CLEAR button  */
 
 static int g_page = PG_MAIN;
 static volatile bool g_run = true;
@@ -398,212 +426,16 @@ static void ncr_add(int x, int y)
     }
 }
 
-static void ncr_rasterize(uint8_t grid[NCR_N][NCR_N])
-{
-  int minx, miny, maxx, maxy, i;
-  int w, h, gw, gh, ox, oy;
-  float s;
-  uint8_t tmp[NCR_N][NCR_N];
-
-  minx = maxx = g_ncr_x[0];
-  miny = maxy = g_ncr_y[0];
-
-  for (i = 1; i < g_ncr_n; i++)
-    {
-      if (g_ncr_x[i] < minx) { minx = g_ncr_x[i]; }
-      if (g_ncr_x[i] > maxx) { maxx = g_ncr_x[i]; }
-      if (g_ncr_y[i] < miny) { miny = g_ncr_y[i]; }
-      if (g_ncr_y[i] > maxy) { maxy = g_ncr_y[i]; }
-    }
-
-  w = maxx - minx + 1;
-  h = maxy - miny + 1;
-  if (w < 1) { w = 1; }
-  if (h < 1) { h = 1; }
-
-  s = (float)(NCR_N - 2) / (w > h ? w : h);
-  gw = (int)(w * s);
-  gh = (int)(h * s);
-  if (gw < 1) { gw = 1; }
-  if (gh < 1) { gh = 1; }
-  ox = (NCR_N - gw) / 2;
-  oy = (NCR_N - gh) / 2;
-
-  memset(grid, 0, NCR_N * NCR_N);
-
-  for (i = 0; i < g_ncr_n; i++)
-    {
-      int gx = ox + (int)((g_ncr_x[i] - minx) * s);
-      int gy = oy + (int)((g_ncr_y[i] - miny) * s);
-
-      if (gx >= 0 && gx < NCR_N && gy >= 0 && gy < NCR_N)
-        {
-          grid[gy][gx] = 1;
-        }
-    }
-
-  /* dilate once (8-neighbour) so thin strokes thicken up */
-  memcpy(tmp, grid, sizeof(tmp));
-  for (i = 0; i < NCR_N * NCR_N; i++)
-    {
-      int gx = i % NCR_N;
-      int gy = i / NCR_N;
-      int dx, dy;
-
-      if (!tmp[gy][gx]) { continue; }
-
-      for (dy = -1; dy <= 1; dy++)
-        {
-          for (dx = -1; dx <= 1; dx++)
-            {
-              int nx = gx + dx;
-              int ny = gy + dy;
-
-              if (nx >= 0 && nx < NCR_N && ny >= 0 && ny < NCR_N)
-                {
-                  grid[ny][nx] = 1;
-                }
-            }
-        }
-    }
-}
-
-static int ncr_match(const uint8_t grid[NCR_N][NCR_N], int tmpl)
-{
-  int best = 0;
-  int dx, dy;
-
-  /* tolerate +/-1 cell misalignment: the stroke may sit slightly off
-   * centre in the 16x16 box (e.g. a '1' drawn at the box edge) */
-  for (dy = -1; dy <= 1; dy++)
-    {
-      for (dx = -1; dx <= 1; dx++)
-        {
-          int hit = 0, tot = 0, thit = 0, ttot = 0;
-          int x, y;
-
-          for (y = 0; y < NCR_N; y++)
-            {
-              for (x = 0; x < NCR_N; x++)
-                {
-                  int gx = x - dx;
-                  int gy = y - dy;
-                  int g = (gx >= 0 && gx < NCR_N && gy >= 0 && gy < NCR_N) ?
-                          grid[gy][gx] : 0;
-                  int bit = (ncr_tmpl[tmpl][y * 2 + (x >> 3)] >>
-                             (7 - (x & 7))) & 1;
-
-                  if (g)
-                    {
-                      tot++;
-                      if (bit) { hit++; }
-                    }
-
-                  if (bit)
-                    {
-                      ttot++;
-                      if (g) { thit++; }
-                    }
-                }
-            }
-
-          if (tot > 0 && ttot > 0)
-            {
-              /* average of both coverage directions (F1-like) */
-              int sc = (hit * 1000 / tot + thit * 1000 / ttot) / 2;
-
-              if (sc > best) { best = sc; }
-            }
-        }
-    }
-
-  return best;
-}
-
-static int ncr_recognize(void)
-{
-  uint8_t grid[NCR_N][NCR_N];
-  int best = -1, bestsc = 0;
-  int t;
-
-  if (g_ncr_n < 8)
-    {
-      return -1;
-    }
-
-  ncr_rasterize(grid);
-
-  for (t = 0; t < 10; t++)
-    {
-      int sc = ncr_match(grid, t);
-
-      if (sc > bestsc)
-        {
-          bestsc = sc;
-          best = t;
-        }
-    }
-
-  return (bestsc >= 250) ? best : -1;
-}
-
-/* Result panel on the right side of the handwriting area:
- *   +------------------+
- *   |    识别:           |
- *   |      5            |   (large digit, centred)
- *   +------------------+
- * Drawn on every recognition (finger lift) and on page enter/clear.
- */
-#define NCR_RX 600
-#define NCR_RY 110
-#define NCR_RW 180
-#define NCR_RH 150
-
-static void ncr_show_result(int r)
-{
-  fb_fill(NCR_RX, NCR_RY, NCR_RW, NCR_RH, C_WHITE);
-  draw_rect(NCR_RX, NCR_RY, NCR_RW, NCR_RH, C_BORDER);
-
-  if (r < 0)
-    {
-      blit_text(NCR_RX + (NCR_RW - GUI_TXT_NCR_NONE_W) / 2, NCR_RY + 55,
-                GUI_TXT_NCR_NONE_W, GUI_TXT_NCR_NONE_H,
-                gui_txt_ncr_none_bits, 1);
-    }
-  else
-    {
-      char d[2] = { (char)('0' + r), '\0' };
-      int dw = digit_text_w(3, d);
-
-      blit_text(NCR_RX + (NCR_RW - GUI_TXT_NCR_LABEL_W) / 2, NCR_RY + 18,
-                GUI_TXT_NCR_LABEL_W, GUI_TXT_NCR_LABEL_H,
-                gui_txt_ncr_label_bits, 1);
-      draw_digit_text(NCR_RX + (NCR_RW - dw) / 2, NCR_RY + 62, 3, d,
-                      C_BLACK);
-    }
-}
-
-static void ncr_end(void)
-{
-  int r = ncr_recognize();
-
-  g_tx = g_ty = -1;
-  ncr_show_result(r);
-
-  /* auto-clear the drawing area so the next digit can be written right
-   * away; the result panel keeps showing the last recognition */
-  fb_fill(HAND_X, HAND_Y, HAND_W, HAND_H, C_WHITE);
-  draw_rect(HAND_X, HAND_Y, HAND_W, HAND_H, C_BORDER);
-  ncr_reset();
-}
-
 static void hand_clear(void)
 {
   fb_fill(HAND_X, HAND_Y, HAND_W, HAND_H, C_WHITE);
   draw_rect(HAND_X, HAND_Y, HAND_W, HAND_H, C_BORDER);
+  fb_fill(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_WHITE);
+  draw_rect(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_BORDER);
+  fb_fill(HW_GX - 8, HW_GY - 8, 16 * HW_GS + 16, 16 * HW_GS + 16, C_WHITE);
+  draw_rect(HW_GX - 8, HW_GY - 8, 16 * HW_GS + 16, 16 * HW_GS + 16, C_BORDER);
   g_ncr_idle = 0;
   ncr_reset();
-  ncr_show_result(-1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -623,7 +455,7 @@ static void draw_main(void)
               gui_title_row2_bits, 1);
 
   /* entry buttons */
-  for (i = 0; i < 3; i++)
+  for (i = 0; i < 4; i++)
     {
       const struct btn *b = &g_btns[i];
 
@@ -632,6 +464,43 @@ static void draw_main(void)
                 b->y + (b->h - b->txt_h) / 2,
                 b->txt_w, b->txt_h, b->txt, 1);
     }
+
+  /* partner logos (v83):
+   *   bottom centre - Wuhan University of Technology
+   *   top left      - Spark Lab + 'spark' caption
+   *   bottom left   - openvela
+   *   top right     - GigaDevice (enlarged)
+   *   bottom right  - Xiaomi
+   */
+  {
+#define LOGO_MARGIN 40
+#define LOGO_TOP_Y  40
+#define LOGO_BOT_Y  392
+
+    /* bottom centre: WHUT */
+    blit_rgb565((LCD_W - LOGO_WHUT_W) / 2, LOGO_BOT_Y,
+                LOGO_WHUT_W, LOGO_WHUT_H, logo_whut_bits);
+
+    /* top-left: Spark Lab + 'spark' caption */
+    blit_rgb565(LOGO_MARGIN, LOGO_TOP_Y, LOGO_SPARK_W, LOGO_SPARK_H,
+                logo_spark_bits);
+    blit_text(LOGO_MARGIN - (GUI_TXT_SPARK_TXT_W - LOGO_SPARK_W) / 2,
+              LOGO_TOP_Y + LOGO_SPARK_H + 4,
+              GUI_TXT_SPARK_TXT_W, GUI_TXT_SPARK_TXT_H,
+              gui_txt_spark_txt_bits, 1);
+
+    /* bottom-left: openvela */
+    blit_rgb565(LOGO_MARGIN, LOGO_BOT_Y, LOGO_OPENVELA_W, LOGO_OPENVELA_H,
+                logo_openvela_bits);
+
+    /* top-right: GigaDevice (enlarged) */
+    blit_rgb565(LCD_W - LOGO_MARGIN - LOGO_GIGADEVICE_W, LOGO_TOP_Y,
+                LOGO_GIGADEVICE_W, LOGO_GIGADEVICE_H, logo_gigadevice_bits);
+
+    /* bottom-right: Xiaomi */
+    blit_rgb565(LCD_W - LOGO_MARGIN - LOGO_XIAOMI_W, LOGO_BOT_Y,
+                LOGO_XIAOMI_W, LOGO_XIAOMI_H, logo_xiaomi_bits);
+  }
 }
 
 static void draw_sub_header(const struct btn *hdr, const uint8_t *hint,
@@ -680,8 +549,13 @@ static void draw_hand_page(void)
             CLEAR_Y + (CLEAR_H - GUI_TXT_CLEAR_H) / 2,
             GUI_TXT_CLEAR_W, GUI_TXT_CLEAR_H, gui_txt_clear_bits, 1);
 
+  /* MLP result box (top-right) + 16x16 preview frame, empty */
+  fb_fill(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_WHITE);
+  draw_rect(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_BORDER);
+  fb_fill(HW_GX - 8, HW_GY - 8, 16 * HW_GS + 16, 16 * HW_GS + 16, C_WHITE);
+  draw_rect(HW_GX - 8, HW_GY - 8, 16 * HW_GS + 16, 16 * HW_GS + 16, C_BORDER);
+
   ncr_reset();
-  ncr_show_result(-1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -712,16 +586,17 @@ static void draw_hand_page(void)
 
 #define FFT_N   256
 #define SP_X    30
-#define SP_Y    95
+#define SP_Y    135
 #define SP_W    360
-#define SP_H    320
+#define SP_H    255
 #define FF_X    410
-#define FF_Y    95
+#define FF_Y    135
 #define FF_W    360
-#define FF_H    320
+#define FF_H    255
 
 static float g_re[FFT_N];
 static float g_im[FFT_N];
+static float g_time[FFT_N];   /* pre-FFT samples, kept for the waveform */
 static int   g_spec_inited = 0;
 static int   g_adc_min = 0;
 static int   g_adc_max = 0;
@@ -812,6 +687,7 @@ static void adc_sample(void)
       }
       g_re[i] = (float)(ADC_RDATA & 0x3FFF);
       g_im[i] = 0.0f;
+      g_time[i] = g_re[i];
 
       {
         int v = (int)g_re[i];
@@ -887,24 +763,75 @@ static void fft_radix2(void)
     }
 }
 
+/* ADC spectrum now runs on a static dataset stored in flash: the 256
+ * samples below (1 kHz @ ~1600 LSB + 2 kHz harmonic + noise, 14-bit)
+ * are FFT-analysed once when the measure page opens and drawn once, so
+ * nothing flickers.  Live sampling stays in the non-STATIC branch.
+ */
+#define MEAS_ADC_STATIC 1
+
+#ifdef MEAS_ADC_STATIC
+#  define SP_MAG_SCALE (SP_H * 0.75f / 204800.0f)  /* static demo data */
+#else
+#  define SP_MAG_SCALE (SP_H / 1040.0f)            /* live ADC, small signals */
+#endif
+
+static const uint16_t g_adc_static[FFT_N] = {
+  8212,8648,8999,9239,9521,9812,9795,9971,9941,9801,9637,9462,
+  9266,9098,8912,8733,8629,8432,8248,8151,7868,7689,7581,7298,
+  7098,6978,6787,6704,6545,6470,6478,6524,6650,6916,7298,7573,
+  7984,8321,8837,9079,9397,9728,9828,9963,9937,9893,9673,9588,
+  9399,9260,8980,8827,8560,8444,8274,8091,8040,7806,7726,7477,
+  7283,7090,6905,6651,6562,6445,6449,6450,6716,6799,7145,7417,
+  7881,8240,8547,9030,9371,9630,9772,9822,9871,9959,9808,9609,
+  9549,9317,9107,8881,8700,8498,8303,8280,8059,7912,7706,7593,
+  7284,7141,6890,6723,6705,6545,6455,6485,6631,6714,6995,7315,
+  7618,8030,8465,8870,9097,9518,9599,9873,9960,9855,9836,9782,
+  9494,9408,9237,8994,8837,8577,8405,8272,8087,7956,7888,7651,
+  7426,7219,7129,6858,6775,6568,6487,6529,6558,6663,6846,7195,
+  7454,7910,8167,8616,8997,9388,9539,9818,9911,9955,9908,9868,
+  9625,9461,9236,9013,8844,8771,8585,8306,8228,8052,7910,7750,
+  7511,7423,7145,6975,6796,6572,6445,6451,6527,6629,6787,6934,
+  7370,7710,8109,8448,8891,9098,9388,9612,9799,9872,9861,9855,
+  9649,9577,9323,9207,8904,8760,8682,8450,8335,8155,7990,7757,
+  7642,7368,7292,7119,6913,6618,6534,6452,6404,6545,6707,6841,
+  7209,7535,7804,8300,8709,8964,9344,9613,9795,9823,9946,9904,
+  9838,9691,9439,9308,9133,8942,8640,8446,8383,8157,8057,7957,
+  7695,7492,7331,7164,6880,6746,6557,6537,6518,6468,6566,6768,
+  6965,7283,7655,8064,
+};
+
+static void adc_static_load(void)
+{
+  int i;
+
+  for (i = 0; i < FFT_N; i++)
+    {
+      g_time[i] = (float)g_adc_static[i];
+      g_re[i] = g_time[i];
+      g_im[i] = 0.0f;
+    }
+}
+
 static void spectrum_draw(void)
 {
   int i, peak = 1;
   float pmax = 0.0f;
 
-  spectrum_init_once();
-  adc_sample();                       /* fill g_re[] with real samples */
-
-  /* left: time-domain waveform */
+  /* left: time-domain waveform (g_time = samples before the in-place FFT) */
   fb_fill(SP_X, SP_Y, SP_W, SP_H, C_WHITE);
   for (i = 1; i < FFT_N; i++)
     {
-      int x0 = SP_X + (i - 1) * SP_W / FFT_N;
-      int y0 = SP_Y + (int)((16383.0f - g_re[i - 1]) * SP_H / 16384.0f);
-      int x1 = SP_X + i * SP_W / FFT_N;
-      int y1 = SP_Y + (int)((16383.0f - g_re[i]) * SP_H / 16384.0f);
+      int y0 = SP_Y + (int)((16383.0f - g_time[i - 1]) * SP_H / 16384.0f);
+      int y1 = SP_Y + (int)((16383.0f - g_time[i]) * SP_H / 16384.0f);
 
-      draw_line(x0, y0, x1, y1, 2, C_BLACK);
+      if (y0 < SP_Y) { y0 = SP_Y; }
+      if (y0 > SP_Y + SP_H) { y0 = SP_Y + SP_H; }
+      if (y1 < SP_Y) { y1 = SP_Y; }
+      if (y1 > SP_Y + SP_H) { y1 = SP_Y + SP_H; }
+
+      draw_line(SP_X + (i - 1) * SP_W / FFT_N, y0,
+                SP_X + i * SP_W / FFT_N, y1, 2, C_BLACK);
     }
   draw_rect(SP_X, SP_Y, SP_W, SP_H, C_BORDER);
 
@@ -920,7 +847,7 @@ static void spectrum_draw(void)
   for (i = 1; i < FFT_N / 2; i++)
     {
       float mag = sqrtf(g_re[i] * g_re[i] + g_im[i] * g_im[i]);
-      int h = (int)(mag * SP_H / 1040.0f);
+      int h = (int)(mag * SP_MAG_SCALE);
 
       if (h > SP_H) { h = SP_H; }
       if (h > 0)
@@ -944,13 +871,240 @@ static void spectrum_draw(void)
   }
 }
 
+/* Red/green LED control (LED0=PC13 red, LED1=PJ8 green, active low).
+ * Direct GPIO registers, same style as the ADC/FFT block above:
+ *   GPIOC = 0x58020800, GPIOJ = 0x58022400 on AHB4
+ *   RCU   = 0x58024400, AHB4EN = +0x3C (bit2 = GPIOC, bit8 = GPIOJ)
+ *   CTL bit pair 01 = output push-pull; OCTL bit 0 = LED on.
+ */
+#define LED_RCU_AHB4EN  (*(volatile uint32_t *)(0x58024400UL + 0x3c))
+#define LED_GPIOC_CTL   (*(volatile uint32_t *)0x58020800UL)
+#define LED_GPIOC_OCTL  (*(volatile uint32_t *)0x58020814UL)
+#define LED_GPIOJ_CTL   (*(volatile uint32_t *)0x58022400UL)
+#define LED_GPIOJ_OCTL  (*(volatile uint32_t *)0x58022414UL)
+
+#define LED_BTN_W 140
+#define LED_BTN_H 42
+#define LED_BTN_Y 70
+#define LED_RED_X   240
+#define LED_GREEN_X 420
+
+static bool g_led_red = false;    /* lit? */
+static bool g_led_green = false;
+static int  g_led_inited = 0;
+static bool g_touch_prev = false;  /* finger was down last frame (edge detect) */
+
+static void led_init(void);         /* defined below (LED block) */
+
+/* ------------------------------------------------------------------ */
+/* Software PWM for the red LED (LED0=PC13) via TIMER1 update IRQ.
+ * PC13 has no timer-channel alternate function (GPIO/RTC only), so we
+ * bit-bang a 100-level duty cycle from the TIMER1 update interrupt.
+ *   TIMER1 = 0x40000000        (GD32_TIMER_BASE, APB1, verified)
+ *   RCU APB1EN = 0x58024440    (RCU base 0x58024400 + 0x40, bit0 TIMER1EN)
+ *   CTL0.CEN(0) | DMAINTEN.UPIE(0) | INTF.UPIF(0)
+ *   PSC=199, CAR=99  ->  ~10 kHz update, 100 Hz PWM @ ~200 MHz APB1 timer.
+ * ------------------------------------------------------------------ */
+#define PWM_RCU_APB1EN (*(volatile uint32_t *)0x58024440UL)
+#define PWM_T1_CTL0    (*(volatile uint32_t *)0x40000000UL)
+#define PWM_T1_DMAINTEN (*(volatile uint32_t *)0x4000000cUL)
+#define PWM_T1_INTF    (*(volatile uint32_t *)0x40000010UL)
+#define PWM_T1_PSC     (*(volatile uint32_t *)0x40000028UL)
+#define PWM_T1_CAR     (*(volatile uint32_t *)0x4000002cUL)
+
+#define PWM_LEVELS 100
+
+static volatile int g_pwm_tick = 0;   /* 0..PWM_LEVELS-1 */
+static int g_pwm_duty = 50;           /* slider: duty cycle 0..100 */
+static int g_pwm_inited = 0;
+
+static int pwm_isr(int irq, void *context, void *arg)
+{
+  (void)irq;
+  (void)context;
+  (void)arg;
+
+  PWM_T1_INTF = 0;                    /* clear UPIF */
+
+  g_pwm_tick++;
+  if (g_pwm_tick >= PWM_LEVELS) { g_pwm_tick = 0; }
+
+  /* LED0 (PC13) active low: OCTL bit13 = 0 -> on.
+   * Fixed duty cycle = brightness control. */
+  if (g_led_red && g_pwm_tick < g_pwm_duty)
+    {
+      LED_GPIOC_OCTL &= ~(1u << 13);
+    }
+  else
+    {
+      LED_GPIOC_OCTL |= (1u << 13);
+    }
+
+  return 0;
+}
+
+static void pwm_init(void)
+{
+  if (g_pwm_inited) { return; }
+  led_init();
+
+  PWM_RCU_APB1EN |= (1u << 0);        /* TIMER1 clock on */
+  PWM_T1_PSC = 199;
+  PWM_T1_CAR = PWM_LEVELS - 1;
+  PWM_T1_INTF = 0;
+  PWM_T1_DMAINTEN |= (1u << 0);       /* UPIE */
+  PWM_T1_CTL0 |= (1u << 0);           /* CEN */
+  irq_attach(44, pwm_isr, NULL);      /* GD32_IRQ_TIMER1 = EXINT+28 = 44 */
+  up_enable_irq(44);
+  g_pwm_inited = 1;
+}
+
+/* duty slider (below the panels) */
+#define PWM_TRACK_X0 60
+#define PWM_TRACK_W  (LCD_W - 120)
+#define PWM_TRACK_Y  452
+#define PWM_TXT_Y    426
+#define PWM_SLIDE_Y0 420
+#define PWM_SLIDE_Y1 472
+
+static int digit_total_w(const char *s)
+{
+  int w = 0;
+
+  while (*s)
+    {
+      if (*s >= '0' && *s <= '9') { w += gui_dig_w[*s - '0']; }
+      s++;
+    }
+  return w;
+}
+
+static void draw_num(int cx, int y, int num)
+{
+  char buf[8];
+  int i, n, x;
+
+  snprintf(buf, sizeof(buf), "%d", num);
+  n = strlen(buf);
+  x = cx - digit_total_w(buf) / 2;
+  for (i = 0; i < n; i++)
+    {
+      int d = buf[i] - '0';
+
+      blit_text(x, y, gui_dig_w[d], GUI_DIG_H, gui_dig_bits[d], 1);
+      x += gui_dig_w[d];
+    }
+}
+
+static void draw_pwm_slider(void)
+{
+  int tx = PWM_TRACK_X0 + g_pwm_duty * PWM_TRACK_W / 100;
+  int lw = GUI_TXT_PWM_LABEL_W;
+
+  /* clear the whole slider strip */
+  fb_fill(30, PWM_SLIDE_Y0, LCD_W - 60, PWM_SLIDE_Y1 - PWM_SLIDE_Y0,
+          C_WHITE);
+
+  blit_center(PWM_TXT_Y, lw, GUI_TXT_PWM_LABEL_H, gui_txt_pwm_label_bits, 1);
+  draw_num((LCD_W + lw) / 2 + 20, PWM_TXT_Y - 2, g_pwm_duty);
+
+  fb_fill(PWM_TRACK_X0, PWM_TRACK_Y, PWM_TRACK_W, 4, C_BORDER);
+  draw_circle(tx, PWM_TRACK_Y + 2, 14, C_HILITE);
+}
+
+static void led_init(void)
+{
+  if (g_led_inited) { return; }
+
+  LED_RCU_AHB4EN |= (1u << 2);    /* GPIOC clock on */
+  LED_RCU_AHB4EN |= (1u << 8);    /* GPIOJ clock on */
+
+  /* PC13 = output push-pull, red off (active low) */
+  LED_GPIOC_CTL = (LED_GPIOC_CTL & ~(3u << 26)) | (1u << 26);
+  LED_GPIOC_OCTL |= (1u << 13);
+
+  /* PJ8 = output push-pull, green off (active low) */
+  LED_GPIOJ_CTL = (LED_GPIOJ_CTL & ~(3u << 16)) | (1u << 16);
+  LED_GPIOJ_OCTL |= (1u << 8);
+
+  g_led_inited = 1;
+}
+
+static void led_set(int red, int green)
+{
+  if (red >= 0)
+    {
+      g_led_red = (red != 0);
+      if (!g_led_red) { LED_GPIOC_OCTL |= (1u << 13); }
+      /* on: the PWM ISR drives PC13 */
+    }
+
+  if (green >= 0)
+    {
+      g_led_green = (green != 0);
+      if (g_led_green) { LED_GPIOJ_OCTL &= ~(1u << 8); }
+      else             { LED_GPIOJ_OCTL |= (1u << 8); }
+    }
+}
+
+static void led_draw_btn(int x, bool on, uint16_t lit)
+{
+  int cy = LED_BTN_Y + LED_BTN_H / 2;
+
+  fb_fill(x, LED_BTN_Y, LED_BTN_W, LED_BTN_H, C_WHITE);
+  draw_rect(x, LED_BTN_Y, LED_BTN_W, LED_BTN_H, C_BORDER);
+
+  /* state dot: lit = filled colour, off = outline */
+  if (on) { draw_circle(x + 20, cy, 9, lit); }
+  else    { draw_circle(x + 20, cy, 9, C_BORDER); }
+
+  /* label, shifted right of the dot */
+  if (x == LED_RED_X)
+    {
+      blit_text(x + 44 + (LED_BTN_W - 44 - GUI_TXT_LED_RED_W) / 2,
+                LED_BTN_Y + (LED_BTN_H - GUI_TXT_LED_RED_H) / 2,
+                GUI_TXT_LED_RED_W, GUI_TXT_LED_RED_H,
+                gui_txt_led_red_bits, 1);
+    }
+  else
+    {
+      blit_text(x + 44 + (LED_BTN_W - 44 - GUI_TXT_LED_GREEN_W) / 2,
+                LED_BTN_Y + (LED_BTN_H - GUI_TXT_LED_GREEN_H) / 2,
+                GUI_TXT_LED_GREEN_W, GUI_TXT_LED_GREEN_H,
+                gui_txt_led_green_bits, 1);
+    }
+}
+
 static void draw_meas_page(void)
 {
   static const struct btn hdr = { 0, 0, 0, 0, PG_MEAS,
     GUI_TXT_HDR3_W, GUI_TXT_HDR3_H, gui_txt_hdr3_bits };
 
   draw_sub_header(&hdr, NULL, 0, 0);
+  led_init();
+  pwm_init();
+  led_draw_btn(LED_RED_X, g_led_red, C_RED);
+  led_draw_btn(LED_GREEN_X, g_led_green, C_GREEN);
+#ifdef MEAS_ADC_STATIC
+  adc_static_load();
+  fft_radix2();
   spectrum_draw();
+#else
+  spectrum_init_once();
+  adc_sample();
+  fft_radix2();
+  spectrum_draw();
+#endif
+
+  /* panel captions below the two frames */
+  blit_text(SP_X + (SP_W - GUI_TXT_SP_LABEL_W) / 2,
+            SP_Y + SP_H + 6, GUI_TXT_SP_LABEL_W, GUI_TXT_SP_LABEL_H,
+            gui_txt_sp_label_bits, 1);
+  blit_text(FF_X + (FF_W - GUI_TXT_FFT_LABEL_W) / 2,
+            FF_Y + FF_H + 6, GUI_TXT_FFT_LABEL_W, GUI_TXT_FFT_LABEL_H,
+            gui_txt_fft_label_bits, 1);
+
+  draw_pwm_slider();
 }
 
 static void draw_sys_page(void)
@@ -969,6 +1123,11 @@ static void draw_sys_page(void)
   int i;
 
   draw_sub_header(&hdr, NULL, 0, 0);
+
+  /* partner logo: GigaDevice under the page title */
+  blit_rgb565((LCD_W - LOGO_GIGADEVICE_W) / 2, 70,
+              LOGO_GIGADEVICE_W, LOGO_GIGADEVICE_H, logo_gigadevice_bits);
+
   for (i = 0; i < 6; i++)
     {
       blit_center(170 + i * 42, rows[i].w, rows[i].h, rows[i].b, 1);
@@ -1008,7 +1167,7 @@ static void touch_main(int x, int y)
 {
   int i;
 
-  for (i = 0; i < 3; i++)
+  for (i = 0; i < 4; i++)
     {
       const struct btn *b = &g_btns[i];
 
@@ -1113,6 +1272,56 @@ static void touch_update(int x, int y)
       break;
 
     case PG_MEAS:
+      touch_sub(x, y);
+      if (g_page != PG_MEAS) { break; }
+
+      /* PWM duty slider: track the finger while held */
+      if (y >= PWM_SLIDE_Y0 && y <= PWM_SLIDE_Y1)
+        {
+          int d = (x - PWM_TRACK_X0) * 100 / PWM_TRACK_W;
+
+          if (d < 0) { d = 0; }
+          if (d > 100) { d = 100; }
+          if (d != g_pwm_duty)
+            {
+              g_pwm_duty = d;
+              draw_pwm_slider();
+            }
+          break;
+        }
+
+      if (g_touch_prev) { break; }   /* held down: ignore repeat presses */
+      g_touch_prev = true;
+
+      if (x >= LED_RED_X && x < LED_RED_X + LED_BTN_W &&
+          y >= LED_BTN_Y && y < LED_BTN_Y + LED_BTN_H)
+        {
+          fb_fill(LED_RED_X, LED_BTN_Y, LED_BTN_W, LED_BTN_H, C_HILITE);
+          blit_text(LED_RED_X + 44 + (LED_BTN_W - 44 - GUI_TXT_LED_RED_W) / 2,
+                    LED_BTN_Y + (LED_BTN_H - GUI_TXT_LED_RED_H) / 2,
+                    GUI_TXT_LED_RED_W, GUI_TXT_LED_RED_H,
+                    gui_txt_led_red_bits, 1);
+          usleep(60000);
+          led_set(!g_led_red, -1);
+          led_draw_btn(LED_RED_X, g_led_red, C_RED);
+          break;
+        }
+
+      if (x >= LED_GREEN_X && x < LED_GREEN_X + LED_BTN_W &&
+          y >= LED_BTN_Y && y < LED_BTN_Y + LED_BTN_H)
+        {
+          fb_fill(LED_GREEN_X, LED_BTN_Y, LED_BTN_W, LED_BTN_H, C_HILITE);
+          blit_text(LED_GREEN_X + 44 + (LED_BTN_W - 44 - GUI_TXT_LED_GREEN_W) / 2,
+                    LED_BTN_Y + (LED_BTN_H - GUI_TXT_LED_GREEN_H) / 2,
+                    GUI_TXT_LED_GREEN_W, GUI_TXT_LED_GREEN_H,
+                    gui_txt_led_green_bits, 1);
+          usleep(60000);
+          led_set(-1, !g_led_green);
+          led_draw_btn(LED_GREEN_X, g_led_green, C_GREEN);
+          break;
+        }
+      break;
+
     case PG_SYS:
       touch_sub(x, y);
       break;
@@ -1165,6 +1374,13 @@ static void console_key(void)
       ncr_reset();
       draw_page();
     }
+  else if (c == '4')
+    {
+      g_page = PG_HAND;
+      g_tx = g_ty = -1;
+      ncr_reset();
+      draw_page();
+    }
   else if (c == 'b' || c == 'B')
     {
       g_page = PG_MAIN;
@@ -1182,9 +1398,18 @@ static void console_key(void)
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
+static void hw_export(void);
+
+static int hw_run(void);
+
 int main(int argc, FAR char *argv[])
 {
   int ret;
+
+  if (argc > 1 && strcmp(argv[1], "hw") == 0)
+    {
+      return hw_run();
+    }
 
   if (board_lcd_enable() != OK)
     {
@@ -1221,19 +1446,23 @@ int main(int argc, FAR char *argv[])
                 {
                   touch_update(x, y);
                 }
-              else if (g_page == PG_HAND && g_ncr_n > 0 &&
-                       g_ncr_idle == 0)
+              else
                 {
-                  /* finger lifted (edge only): start idle counting,
-                   * recognise only after NCR_IDLE_LOOPS of no new touch
-                   * (example 33).  The g_ncr_idle==0 guard makes this a
-                   * one-shot edge trigger, not a per-loop reset. */
-                  g_ncr_idle = 1;
-                  g_tx = g_ty = -1;
-                }
-              else if (g_page == PG_TOUCH || g_page == PG_HAND)
-                {
-                  g_tx = g_ty = -1;  /* end stroke */
+                  g_touch_prev = false;   /* finger up: re-arm button edge */
+                  if (g_page == PG_HAND && g_ncr_n > 0 &&
+                      g_ncr_idle == 0)
+                    {
+                      /* finger lifted (edge only): start idle counting,
+                       * recognise only after NCR_IDLE_LOOPS of no new touch
+                       * (example 33).  The g_ncr_idle==0 guard makes this a
+                       * one-shot edge trigger, not a per-loop reset. */
+                      g_ncr_idle = 1;
+                      g_tx = g_ty = -1;
+                    }
+                  else if (g_page == PG_TOUCH || g_page == PG_HAND)
+                    {
+                      g_tx = g_ty = -1;  /* end stroke */
+                    }
                 }
             }
         }
@@ -1243,7 +1472,7 @@ int main(int argc, FAR char *argv[])
           if (++g_ncr_idle > NCR_IDLE_LOOPS)
             {
               g_ncr_idle = 0;
-              ncr_end();   /* stroke finished: recognise + auto-clear */
+              hw_export();   /* 32x32 raster + int8 MLP + serial export */
             }
         }
 
@@ -1254,14 +1483,377 @@ int main(int argc, FAR char *argv[])
 
       if (g_page == PG_MEAS)
         {
+#ifndef MEAS_ADC_STATIC
           adc_sample();
           fft_radix2();
           spectrum_draw();
+#endif
         }
 
       usleep(20000);
     }
 
   printf("GUI: stopped, back to shell\n");
+  return OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* hw - handwriting grid export (subcommand: gui hw, v68d)             */
+/* ------------------------------------------------------------------ */
+/* Write a digit on the canvas, lift the finger; after ~400 ms of no
+ * touch the stroke is rasterised to a 32x32 grid (Bresenham segment
+ * interpolation, aspect-preserving bbox normalisation, no dilation),
+ * printed to the serial console for offline capture, and shown on the
+ * right side as a 16x16 preview (downsampled + dilated once for
+ * visibility).  The canvas then clears for the next digit.  q quits.
+ */
+
+/* HW_N / HW_GS / HW_GX / HW_GY are now defined by gui_main_v67.c (v70) */
+#include "digit_net.h"
+
+/* int8 MLP forward pass on the 32x32 grid; returns 0..9 */
+static int net_predict(const uint8_t grid[HW_N][HW_N])
+{
+  int32_t acc[NET_H];
+  float h[NET_H];
+  float z[NET_OUT];
+  int i, j, k;
+
+  memset(acc, 0, sizeof(acc));
+
+  for (i = 0; i < HW_N * HW_N; i++)
+    {
+      if (grid[i / HW_N][i % HW_N])
+        {
+          for (j = 0; j < NET_H; j++)
+            {
+              acc[j] += net_w1[i * NET_H + j];
+            }
+        }
+    }
+
+  for (j = 0; j < NET_H; j++)
+    {
+      float v = ((float)(acc[j] + net_b1[j])) * net_s1;
+
+      h[j] = (v > 0.0f) ? v : 0.0f;
+    }
+
+  for (k = 0; k < NET_OUT; k++)
+    {
+      float s = 0.0f;
+
+      for (j = 0; j < NET_H; j++)
+        {
+          s += h[j] * (float)net_w2[j * NET_OUT + k];
+        }
+
+      z[k] = s * net_s2 + (float)net_b2[k] * net_s2;
+    }
+
+  k = 0;
+  for (i = 1; i < NET_OUT; i++)
+    {
+      if (z[i] > z[k]) { k = i; }
+    }
+
+  return k;
+}
+
+static void hw_draw_canvas(void)
+{
+  fb_fill(0, 0, LCD_W, LCD_H, C_WHITE);
+
+  /* hint line (reuse the handwriting page hint text) */
+  blit_text(40, 64, GUI_TXT_HINT_HAND_W, GUI_TXT_HINT_HAND_H,
+            gui_txt_hint_hand_bits, 1);
+
+  /* writing canvas */
+  draw_rect(HAND_X, HAND_Y, HAND_W, HAND_H, C_BORDER);
+}
+
+/* 32x32 rasterisation: scale the stroke bbox into HW_N-2 cells keeping
+ * the aspect ratio, centre it, and mark every pixel along every segment
+ * (Bresenham) so thin strokes stay connected.  No dilation - the PC side
+ * decides how thick the digit should be. */
+static void hw_rasterize(uint8_t grid[HW_N][HW_N])
+{
+  int minx, miny, maxx, maxy, i;
+  int w, h, gw, gh, ox, oy;
+  float s;
+
+  minx = maxx = g_ncr_x[0];
+  miny = maxy = g_ncr_y[0];
+
+  for (i = 1; i < g_ncr_n; i++)
+    {
+      if (g_ncr_x[i] < minx) { minx = g_ncr_x[i]; }
+      if (g_ncr_x[i] > maxx) { maxx = g_ncr_x[i]; }
+      if (g_ncr_y[i] < miny) { miny = g_ncr_y[i]; }
+      if (g_ncr_y[i] > maxy) { maxy = g_ncr_y[i]; }
+    }
+
+  w = maxx - minx + 1;
+  h = maxy - miny + 1;
+  if (w < 1) { w = 1; }
+  if (h < 1) { h = 1; }
+
+  s = (float)(HW_N - 2) / (w > h ? w : h);
+  gw = (int)(w * s);
+  gh = (int)(h * s);
+  if (gw < 1) { gw = 1; }
+  if (gh < 1) { gh = 1; }
+
+  ox = (HW_N - gw) / 2;
+  oy = (HW_N - gh) / 2;
+
+  memset(grid, 0, HW_N * HW_N);
+
+  for (i = 0; i < g_ncr_n; i++)
+    {
+      int x0, y0, x1, y1;
+      int steps, k;
+
+      if (i == 0)
+        {
+          x0 = x1 = g_ncr_x[0];
+          y0 = y1 = g_ncr_y[0];
+        }
+      else
+        {
+          x0 = g_ncr_x[i - 1];
+          y0 = g_ncr_y[i - 1];
+          x1 = g_ncr_x[i];
+          y1 = g_ncr_y[i];
+        }
+
+      steps = (x1 - x0) > 0 ? (x1 - x0) : -(x1 - x0);
+      if ((y1 - y0) > steps) { steps = y1 - y0; }
+      if (-(y1 - y0) > steps) { steps = -(y1 - y0); }
+      if (steps < 1) { steps = 1; }
+
+      for (k = 0; k <= steps; k++)
+        {
+          int px = x0 + (x1 - x0) * k / steps;
+          int py = y0 + (y1 - y0) * k / steps;
+          int gx = ox + (int)((px - minx) * s);
+          int gy = oy + (int)((py - miny) * s);
+
+          if (gx >= 0 && gx < HW_N && gy >= 0 && gy < HW_N)
+            {
+              grid[gy][gx] = 1;
+            }
+        }
+    }
+}
+
+static void hw_export(void)
+{
+  uint8_t grid[HW_N][HW_N];
+  int minx, miny, maxx, maxy, i, y;
+  int d;
+
+  if (g_ncr_n < 4)
+    {
+      return;
+    }
+
+  minx = maxx = g_ncr_x[0];
+  miny = maxy = g_ncr_y[0];
+
+  for (i = 1; i < g_ncr_n; i++)
+    {
+      if (g_ncr_x[i] < minx) { minx = g_ncr_x[i]; }
+      if (g_ncr_x[i] > maxx) { maxx = g_ncr_x[i]; }
+      if (g_ncr_y[i] < miny) { miny = g_ncr_y[i]; }
+      if (g_ncr_y[i] > maxy) { maxy = g_ncr_y[i]; }
+    }
+
+  hw_rasterize(grid);
+
+  printf("\nHW: pts=%d bbox=(%d,%d)-(%d,%d)\n",
+         g_ncr_n, minx, miny, maxx, maxy);
+  printf("HW: grid %d\n", HW_N);
+
+  for (y = 0; y < HW_N; y++)
+    {
+      int x;
+
+      printf("HW: ");
+      for (x = 0; x < HW_N; x++)
+        {
+          putchar(grid[y][x] ? '1' : '0');
+        }
+
+      putchar('\n');
+    }
+
+  printf("HW: END\n");
+
+  /* recognise the digit and show it top-right */
+  d = net_predict(grid);
+  printf("HW: digit=%d\n", d);
+
+  {
+    char s[2];
+
+    s[0] = (char)('0' + d);
+    s[1] = '\0';
+
+    fb_fill(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_WHITE);
+    draw_rect(LCD_W - 200, 40, 180, GUI_DIG_H + 16, C_BORDER);
+    blit_digits(LCD_W - 190, 48, s, C_BLACK);
+  }
+
+  /* 16x16 preview on the right (downsample, then dilate once) */
+  {
+    int gs = HW_GS;
+    int gx0 = HW_GX;
+    int gy0 = HW_GY;
+    uint8_t pv[16][16];
+    uint8_t tmp[16][16];
+
+    memset(pv, 0, sizeof(pv));
+
+    for (y = 0; y < HW_N; y++)
+      {
+        for (i = 0; i < HW_N; i++)
+          {
+            if (grid[y][i])
+              {
+                pv[y / 2][i / 2] = 1;
+              }
+          }
+      }
+
+    memcpy(tmp, pv, sizeof(tmp));
+
+    for (y = 0; y < 16; y++)
+      {
+        for (i = 0; i < 16; i++)
+          {
+            int dx, dy;
+
+            if (!tmp[y][i]) { continue; }
+
+            for (dy = -1; dy <= 1; dy++)
+              {
+                for (dx = -1; dx <= 1; dx++)
+                  {
+                    int ny = y + dy;
+                    int nx = i + dx;
+
+                    if (ny >= 0 && ny < 16 && nx >= 0 && nx < 16)
+                      {
+                        pv[ny][nx] = 1;
+                      }
+                  }
+              }
+          }
+      }
+
+    fb_fill(gx0 - 8, gy0 - 8, 16 * gs + 16, 16 * gs + 16, C_WHITE);
+    draw_rect(gx0 - 8, gy0 - 8, 16 * gs + 16, 16 * gs + 16, C_BORDER);
+
+    for (y = 0; y < 16; y++)
+      {
+        for (i = 0; i < 16; i++)
+          {
+            if (pv[y][i])
+              {
+                fb_fill(gx0 + i * gs, gy0 + y * gs, gs, gs, C_BLACK);
+              }
+          }
+      }
+  }
+
+  /* auto-clear the canvas for the next digit */
+  fb_fill(HAND_X, HAND_Y, HAND_W, HAND_H, C_WHITE);
+  draw_rect(HAND_X, HAND_Y, HAND_W, HAND_H, C_BORDER);
+  ncr_reset();
+}
+
+static int hw_run(void)
+{
+  int ret;
+  bool run = true;
+  int idle = 0;
+
+  if (board_lcd_enable() != OK)
+    {
+      fprintf(stderr, "HW: LCD enable failed\n");
+      return EXIT_FAILURE;
+    }
+
+  ret = gt911_lower_init();
+  if (ret != OK)
+    {
+      fprintf(stderr, "HW: touch init failed %d (keyboard only)\n", ret);
+    }
+
+  ncr_reset();
+  g_tx = g_ty = -1;
+  hw_draw_canvas();
+  printf("HW: write a digit on the canvas, lift finger to export (q to quit)\n");
+
+  while (run)
+    {
+      int x = -1;
+      int y = -1;
+      int down = 0;
+
+      if (gt911_lower_scan(&x, &y, &down) == OK)
+        {
+          if (down)
+            {
+              if (x >= HAND_X && x < HAND_X + HAND_W &&
+                  y >= HAND_Y && y < HAND_Y + HAND_H)
+                {
+                  idle = 0;   /* touching: cancel pending export */
+
+                  if (g_tx >= 0 && g_ty >= 0)
+                    {
+                      draw_line(g_tx, g_ty, x, y, 6, C_BLACK);
+                    }
+                  else
+                    {
+                      draw_circle(x, y, 3, C_BLACK);
+                    }
+
+                  ncr_add(x, y);
+                  g_tx = x;
+                  g_ty = y;
+                }
+            }
+          else if (g_ncr_n > 0 && idle == 0)
+            {
+              idle = 1;       /* finger up (edge): start idle count */
+              g_tx = g_ty = -1;
+            }
+        }
+
+      if (idle > 0)
+        {
+          if (++idle > 20)    /* ~400 ms of no touch */
+            {
+              idle = 0;
+              hw_export();
+            }
+        }
+
+      if (gui_anykey())
+        {
+          char c;
+
+          if (read(0, &c, 1) == 1 && (c == 'q' || c == 'Q'))
+            {
+              run = false;
+            }
+        }
+
+      usleep(20000);
+    }
+
+  printf("HW: stopped\n");
   return OK;
 }
