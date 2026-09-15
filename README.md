@@ -4,6 +4,28 @@
 
 在慧勤智远 GD32H759IMT6（V1.3 小系统板，Cortex-M7 @ 600MHz）上完成 **openvela（NuttX 变体）的硬件适配与工业触控可视化系统**：跑通外部 SDRAM（W9825G6KH）、板上 LED、按键、GT911/GT1158 电容触摸、TLI 并行 RGB LCD（800x480 WKS43WV067），并基于 framebuffer 自绘一套 **白底 GUI 可视化系统**（主界面 4 入口：触摸跟随 / 手写识别 / 测量控制 / 系统信息）。测量控制页内置 **ADC 采集 + FFT 频谱分析**（ADC0 14bit 软件触发采样 256 点，时域波形 / 128 条频谱 / 主峰频率，外部模拟信号接 PA4 = ADC0_CH18）与 **红/绿 LED 控制 + PWM 亮度调节**（TIMER1 软件 PWM 驱动红灯 PC13，滑块实时调占空比）。主界面集成五方合作方标识（武汉理工大学 / 小米 / openvela / 兆易创新 / 火花实验室）。
 
+## 实物展示
+
+<p align="center">
+  <img src="images/main_interface.jpg" alt="主界面" width="45%">
+  <img src="images/core_board.jpg" alt="核心板" width="45%">
+</p>
+<p align="center">
+  <img src="images/touch_follow.jpg" alt="触摸跟随" width="45%">
+  <img src="images/measurement.jpg" alt="测量控制" width="45%">
+</p>
+<p align="center">
+  <img src="images/handwriting.jpg" alt="手写识别" width="45%">
+  <img src="images/sysinfo.jpg" alt="系统信息" width="45%">
+</p>
+
+- **主界面**：白底 GUI 四入口（触摸跟随 / 手写识别 / 测量控制 / 系统信息），集成五方合作方标识（武汉理工大学 / 小米 / openvela / 兆易创新 / 火花实验室）
+- **核心板**：慧勤智远 GD32H759IMT6 V1.3 小系统板（Cortex-M7 @ 600MHz，LQFP176）
+- **触摸跟随**：GT911 电容触摸坐标跟随画线
+- **测量控制**：ADC 采集 + FFT 频谱 / 红绿 LED 控制 / PWM 亮度滑块
+- **手写识别**：自有数据训练 MLP（0-9 各 10 样本），端侧 int8 量化推理 <10ms
+- **系统信息**：主控 / 时钟 / 内存 / 屏幕参数展示
+
 ## 二、选题方向
 
 **新硬件适配**。将 openvela（NuttX）完整移植到国产 GD32H759IMT6 微控制器平台，覆盖 BSP、外设驱动、NSH 基础运行环境、板级使能（bringup）与工业触控上层应用。
